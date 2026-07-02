@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Interface web para estimativa de brilho solar com XGBoost.
-Aceita entrada manual ou upload de arquivo CSV.
+Interface web para estimativa de brilho solar.
+Comparação entre XGBoost e Lasso, com e sem radiação de onda longa.
+Resultado em minutos de sol por hora.
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
+import json
+import os
 from xgboost import XGBRegressor
 from datetime import datetime
-import io
 
 # -------------------------------------------------------------------
-# Funções astronômicas (mesmas do treinamento)
+# Funções astronômicas
 # -------------------------------------------------------------------
 def solar_declination(doy):
     return 23.45 * np.sin(np.deg2rad(360.0 / 365.0 * (284 + doy)))
@@ -40,50 +42,128 @@ def cos_zenith(lat, doy, hour):
     return max(0.0, cz)
 
 # -------------------------------------------------------------------
-# Carregar modelo (cache para não recarregar)
+# Carregamento dos modelos
 # -------------------------------------------------------------------
 @st.cache_resource
-def load_model():
-    model = XGBRegressor()
-    model.load_model('modelo_xgb_inso.json')
-    return model
+def load_models():
+    models = {}
+    
+    # XGBoost com LW
+    if os.path.exists('modelo_xgb_inso.json'):
+        xgb_lw = XGBRegressor()
+        xgb_lw.load_model('modelo_xgb_inso.json')
+        models['XGBoost (com LW)'] = {'type': 'xgb', 'model': xgb_lw, 'lw': True}
+    
+    # XGBoost sem LW
+    if os.path.exists('modelo_xgb_inso_semLW.json'):
+        xgb_nlw = XGBRegressor()
+        xgb_nlw.load_model('modelo_xgb_inso_semLW.json')
+        models['XGBoost (sem LW)'] = {'type': 'xgb', 'model': xgb_nlw, 'lw': False}
+    
+    # Lasso com LW
+    if os.path.exists('lasso_comLW.json'):
+        with open('lasso_comLW.json') as f:
+            lasso_lw = json.load(f)
+        models['Lasso (com LW)'] = {'type': 'lasso', 'coef': lasso_lw, 'lw': True}
+    
+    # Lasso sem LW
+    if os.path.exists('lasso_semLW.json'):
+        with open('lasso_semLW.json') as f:
+            lasso_nlw = json.load(f)
+        models['Lasso (sem LW)'] = {'type': 'lasso', 'coef': lasso_nlw, 'lw': False}
+    
+    return models
 
 # -------------------------------------------------------------------
-# Função de previsão única
+# Funções de predição
 # -------------------------------------------------------------------
-def predict_inso(model, lat, doy, hour, sw_top, lw_top, lw_bot,
-                 t_air, humidity, pressure, wind, sw_bot, rain):
+def predict_xgb(model_obj, lat, doy, hour, sw_top, lw_top, lw_bot,
+                t_air, humidity, pressure, wind, sw_bot, rain, use_lw):
     G0h = hourly_extraterrestrial_radiation(lat, doy, hour)
     if G0h < 1.0:
         return 0.0
     Kt = (sw_top * 3600.0) / G0h
     cz = cos_zenith(lat, doy, hour)
-    features = np.array([[Kt, cz, t_air, humidity, pressure, wind,
-                          lw_top, lw_bot, sw_bot, rain]])
-    inso = model.predict(features)[0]
+    if use_lw:
+        features = [Kt, cz, t_air, humidity, pressure, wind,
+                    lw_top, lw_bot, sw_bot, rain]
+    else:
+        features = [Kt, cz, t_air, humidity, pressure, wind, sw_bot, rain]
+    inso = model_obj.predict(np.array([features]))[0]
     return float(np.clip(inso, 0.0, 1.0))
+
+def predict_lasso(coef_data, lat, doy, hour, sw_top, lw_top, lw_bot,
+                  t_air, humidity, pressure, wind, sw_bot, rain, use_lw):
+    G0h = hourly_extraterrestrial_radiation(lat, doy, hour)
+    if G0h < 1.0:
+        return 0.0
+    Kt = (sw_top * 3600.0) / G0h
+    cz = cos_zenith(lat, doy, hour)
+    # Dicionário com todas as variáveis possíveis
+    vars_all = {
+        'Kt': Kt, 'cos_zen': cz, 'T_air': t_air, 'Humidity': humidity,
+        'Pressure': pressure, 'Wind': wind,
+        'LWTop': lw_top, 'LWBot': lw_bot, 'SWBot': sw_bot, 'Rain': rain
+    }
+    intercept = coef_data['intercept']
+    coef = coef_data['coef']
+    inso = intercept
+    for var, val in coef.items():
+        if var in vars_all:
+            inso += val * vars_all[var]
+    return float(np.clip(inso, 0.0, 1.0))
+
+def predict_all(models, lat, doy, hour, sw_top, lw_top, lw_bot,
+                t_air, humidity, pressure, wind, sw_bot, rain):
+    results = {}
+    for name, info in models.items():
+        if info['type'] == 'xgb':
+            pred = predict_xgb(info['model'], lat, doy, hour,
+                               sw_top, lw_top, lw_bot,
+                               t_air, humidity, pressure, wind,
+                               sw_bot, rain, info['lw'])
+        else:  # lasso
+            pred = predict_lasso(info['coef'], lat, doy, hour,
+                                 sw_top, lw_top, lw_bot,
+                                 t_air, humidity, pressure, wind,
+                                 sw_bot, rain, info['lw'])
+        # Converter para minutos de sol na hora
+        results[name] = round(pred * 60, 2)
+    return results
 
 # -------------------------------------------------------------------
 # Interface Streamlit
 # -------------------------------------------------------------------
 st.set_page_config(page_title='Estimador de Brilho Solar', layout='wide')
 st.title('☀️ Estimador de Fração de Insolação Horária')
-st.markdown('Modelo XGBoost treinado com dados de Itajubá-MG (inclui radiação de onda longa).')
+st.markdown('Comparação entre modelos XGBoost e Lasso (com e sem radiação de onda longa).')
 
-model = load_model()
+models = load_models()
+if not models:
+    st.error('Nenhum modelo encontrado. Verifique os arquivos na pasta do aplicativo.')
+    st.stop()
 
-# Barra lateral para escolha do modo
+# Barra lateral: seleção de modelos
+st.sidebar.header('Modelos a utilizar')
+model_names = list(models.keys())
+selected_models = st.sidebar.multiselect(
+    'Selecione um ou mais modelos:',
+    model_names,
+    default=model_names[:1]  # primeiro disponível como padrão
+)
+
+# Modo de entrada
 modo = st.sidebar.radio('Modo de entrada', ['Entrada manual', 'Upload de arquivo CSV'])
 
 if modo == 'Entrada manual':
     st.header('Insira os dados da hora desejada')
     col1, col2, col3 = st.columns(3)
     with col1:
-        lat = st.number_input('Latitude (graus)', value=-22.4269, help='Negativa para sul')
+        lat = st.number_input('Latitude (graus)', value=-22.4269)
         data = st.date_input('Data', value=datetime(2023, 7, 1))
         hora = st.selectbox('Hora local', list(range(24)), index=12)
     with col2:
-        sw_top = st.number_input('SWTop (W/m²)', value=800.0, help='Irradiância global descendente')
+        sw_top = st.number_input('SWTop (W/m²)', value=800.0)
         sw_bot = st.number_input('SWBot (W/m²)', value=80.0)
         lw_top = st.number_input('LWTop (W/m²)', value=350.0)
         lw_bot = st.number_input('LWBot (W/m²)', value=410.0)
@@ -95,54 +175,63 @@ if modo == 'Entrada manual':
         rain = st.number_input('Precipitação (mm)', value=0.0)
 
     doy = data.timetuple().tm_yday
-    if st.button('Estimar'):
-        inso = predict_inso(model, lat, doy, hora,
-                            sw_top, lw_top, lw_bot,
-                            t_air, humidity, pressure, wind,
-                            sw_bot, rain)
-        st.success(f'**Fração de brilho solar estimada:** {inso:.4f}')
-        st.progress(float(inso))
 
-else:
+    if st.button('Estimar'):
+        if not selected_models:
+            st.warning('Selecione pelo menos um modelo na barra lateral.')
+        else:
+            res = predict_all({k: models[k] for k in selected_models},
+                              lat, doy, hora,
+                              sw_top, lw_top, lw_bot,
+                              t_air, humidity, pressure, wind,
+                              sw_bot, rain)
+            st.subheader('Resultados (minutos de sol na hora)')
+            df_res = pd.DataFrame(res.items(), columns=['Modelo', 'Minutos de sol'])
+            st.dataframe(df_res)
+            # Mostrar também um gráfico de barras comparativo
+            st.bar_chart(df_res.set_index('Modelo'))
+
+else:  # Upload de arquivo
     st.header('Upload de arquivo CSV')
     st.markdown("""
     O arquivo deve conter as colunas (com ou sem cabeçalho):
-    `lat, doy, hour, SWTop, LWTop, LWBot, T_air, Humidity, Pressure, Wind, SWBot, Rain`
-    Se o arquivo tiver `date` (DD/MM/YYYY) em vez de `doy`, a conversão será automática.
+    `lat, doy, hour, SWTop, SWBot, LWTop, LWBot, T_air, Humidity, Pressure, Wind, Rain`
+    Se houver `date` (DD/MM/YYYY) em vez de `doy`, a conversão será automática.
     """)
     arquivo = st.file_uploader('Selecione o arquivo CSV', type=['csv', 'txt'])
-    if arquivo:
+    if arquivo and selected_models:
         try:
             df = pd.read_csv(arquivo, sep=None, engine='python')
         except:
             df = pd.read_csv(arquivo, sep=';')
         st.write('Pré-visualização:', df.head())
 
-        # Converter date para doy se necessário
         if 'date' in df.columns and 'doy' not in df.columns:
             df['date'] = pd.to_datetime(df['date'], dayfirst=True)
             df['doy'] = df['date'].dt.dayofyear
 
-        required = ['lat', 'doy', 'hour', 'SWTop', 'LWTop', 'LWBot',
-                    'T_air', 'Humidity', 'Pressure', 'Wind', 'SWBot', 'Rain']
+        required = ['lat', 'doy', 'hour', 'SWTop', 'SWBot', 'LWTop', 'LWBot',
+                    'T_air', 'Humidity', 'Pressure', 'Wind', 'Rain']
         missing = [c for c in required if c not in df.columns]
         if missing:
             st.error(f'Colunas faltando: {missing}')
         else:
             df = df.fillna(0)
-            previsoes = []
-            for _, row in df.iterrows():
-                inso = predict_inso(model,
-                                    row['lat'], int(row['doy']), int(row['hour']),
-                                    row['SWTop'], row['LWTop'], row['LWBot'],
-                                    row['T_air'], row['Humidity'], row['Pressure'],
-                                    row['Wind'], row['SWBot'], row['Rain'])
-                previsoes.append(inso)
-            df['inso_predito'] = previsoes
+            progress = st.progress(0)
+            total = len(df)
+            for i, (_, row) in enumerate(df.iterrows()):
+                res = predict_all({k: models[k] for k in selected_models},
+                                  row['lat'], int(row['doy']), int(row['hour']),
+                                  row['SWTop'], row['LWTop'], row['LWBot'],
+                                  row['T_air'], row['Humidity'], row['Pressure'],
+                                  row['Wind'], row['SWBot'], row['Rain'])
+                for model_name, minutos in res.items():
+                    df.at[i, f'min_sol_{model_name}'] = minutos
+                progress.progress((i+1)/total)
             st.success('Estimativas calculadas!')
-            st.dataframe(df[['lat', 'doy', 'hour', 'SWTop', 'inso_predito']])
+            colunas_exibir = ['lat', 'doy', 'hour', 'SWTop']
+            colunas_exibir += [f'min_sol_{m}' for m in selected_models]
+            st.dataframe(df[colunas_exibir])
 
-            # Download
             csv = df.to_csv(index=False, sep=';').encode('utf-8')
-            st.download_button('Baixar resultados', csv,
-                               'resultado.csv', 'text/csv')
+            st.download_button('Baixar resultados', csv, 'resultado.csv', 'text/csv')
